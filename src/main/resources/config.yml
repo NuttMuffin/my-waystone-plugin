@@ -1,8 +1,18 @@
-# Seconds a player must wait between teleports
+# Seconds a player must stand still (no moving, no damage) before a teleport happens
+warmup-seconds: 3
+
+# Seconds a player must wait between teleports (only starts after a successful teleport)
 cooldown-seconds: 5
 
-# If true, players only see waystones they have already activated (right-clicked)
+# Players must walk up and click a waystone to discover it before they can travel to it
 require-discovery: true
 
-# Allow teleporting between worlds (overworld, nether, end, etc.)
+# Allow teleporting between worlds / dimensions
 cross-world: true
+
+# Tamed pets that are following the player (not sitting) travel along.
+# Leashed animals and ridden vehicles always come along.
+bring-following-pets: true
+
+# How close (in blocks) a following pet must be to come along
+pet-range: 15
