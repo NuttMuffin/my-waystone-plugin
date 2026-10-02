@@ -101,6 +101,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         Dim dim = Dim.OVERWORLD;
         Sort sort = Sort.DISTANCE;
         int page = 0;
+        boolean favOnly = false;
         Inventory inv;
 
         Gui(Kind kind, UUID waystone) {
@@ -142,6 +143,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     // Constants & state
     // ====================================================================
     private static final int PER_PAGE = 45;
+    private static final int TP_PER_PAGE = 36; // teleport menu: 4 rows of waystones + 2 control rows
 
     private static final Set<Material> HAZARDS = EnumSet.of(
             Material.LAVA, Material.FIRE, Material.SOUL_FIRE, Material.CACTUS, Material.MAGMA_BLOCK,
@@ -502,7 +504,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
     private Transformation spinTransform(double angle) {
         return new Transformation(new Vector3f(), new AxisAngle4f((float) angle, 0f, 1f, 0f),
-                new Vector3f(0.6f, 0.6f, 0.6f), new AxisAngle4f(0f, 0f, 1f, 0f));
+                new Vector3f(1.2f, 1.2f, 1.2f), new AxisAngle4f(0f, 0f, 1f, 0f));
     }
 
     private void refreshHologram(Waystone w) {
@@ -511,7 +513,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
         Location nameLoc = w.base.clone().add(0.5, 3.55, 0.5);
         Location statusLoc = w.base.clone().add(0.5, 3.30, 0.5);
-        Location itemLoc = w.base.clone().add(0.5, 4.25, 0.5);
+        Location itemLoc = w.base.clone().add(0.5, 4.12, 0.5);
 
         if (w.holoName == null || !w.holoName.isValid()) {
             w.holoName = spawnText(nameLoc, true); // name is always visible to everyone
@@ -574,8 +576,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     /** Green "Active" only for players who discovered a public, activated waystone. */
     private boolean activeFor(Player p, Waystone w) {
         return w.active && !w.isPrivate
-                && (w.owner.equals(p.getUniqueId())
-                || discovered.getOrDefault(p.getUniqueId(), Collections.emptySet()).contains(w.id));
+                && discovered.getOrDefault(p.getUniqueId(), Collections.emptySet()).contains(w.id);
     }
 
     private void applyVisibility(Player p, Waystone w) {
@@ -914,7 +915,12 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         return Math.sqrt(dx * dx + dz * dz) + 1_000_000.0;
     }
 
-    private List<Waystone> listFor(Player p, Waystone from, Dim dim, Sort sort) {
+    private ItemStack exitButton() {
+        return button(Material.BARRIER, ChatColor.RED + "Exit", "close", false,
+                ChatColor.GRAY + "Close this menu");
+    }
+
+    private List<Waystone> listFor(Player p, Waystone from, Dim dim, boolean favOnly, Sort sort) {
         boolean needDiscovery = getConfig().getBoolean("require-discovery", true);
         boolean cross = getConfig().getBoolean("cross-world", true);
         Set<UUID> known = discovered.getOrDefault(p.getUniqueId(), Collections.emptySet());
@@ -926,33 +932,35 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             case NAME -> Comparator.comparing((Waystone w) -> plainName(w).toLowerCase());
             case NEWEST -> Comparator.comparingLong((Waystone w) -> -w.created);
         };
+        Comparator<Waystone> order = favOnly ? second : pinned.thenComparing(second);
 
         return waystones.values().stream()
                 .filter(w -> !w.id.equals(from.id))
                 .filter(w -> w.active)
                 .filter(w -> visibleTo(p, w))
-                .filter(w -> !needDiscovery || known.contains(w.id) || w.owner.equals(p.getUniqueId()))
+                .filter(w -> !needDiscovery || known.contains(w.id))
                 .filter(w -> cross || w.base.getWorld().equals(from.base.getWorld()))
-                .filter(w -> dimOf(w) == dim)
-                .sorted(pinned.thenComparing(second))
+                .filter(w -> favOnly ? favs.contains(w.id) : dimOf(w) == dim)
+                .sorted(order)
                 .collect(Collectors.toList());
     }
 
-    private ItemStack waystoneItem(Player p, Waystone w) {
+    private ItemStack waystoneItem(Player p, Waystone w, boolean showDim) {
         boolean fav = isFavorite(p, w);
         ItemStack it = new ItemStack(w.icon);
         ItemMeta m = it.getItemMeta();
         m.setDisplayName((fav ? ChatColor.GOLD + "\u2605 " : "") + w.nameColor + plainName(w));
         List<String> lore = new ArrayList<>();
         lore.add(ChatColor.GRAY + "Owner: " + w.ownerName);
-        lore.add(ChatColor.GRAY + "World: " + w.base.getWorld().getName());
+        lore.add(ChatColor.GRAY + "World: " + w.base.getWorld().getName()
+                + (showDim ? " (" + dimName(dimOf(w)) + ")" : ""));
         if (w.base.getWorld().equals(p.getWorld())) {
             lore.add(ChatColor.GRAY + "Distance: " + (int) w.base.distance(p.getLocation()) + " blocks");
         }
         if (w.isPrivate) lore.add(ChatColor.RED + "Private");
         lore.add("");
         lore.add(ChatColor.YELLOW + "Left-click: teleport");
-        lore.add(ChatColor.YELLOW + "Right-click: " + (fav ? "unpin" : "pin to top"));
+        lore.add(ChatColor.YELLOW + "Right-click: " + (fav ? "remove from favorites" : "add to favorites"));
         m.setLore(lore);
         if (fav) m.setEnchantmentGlintOverride(true);
         m.getPersistentDataContainer().set(actionKey, PersistentDataType.STRING, "tp:" + w.id);
@@ -961,52 +969,74 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     }
 
     private void renderTeleport(Player p, Gui g, Waystone from) {
-        List<Waystone> list = listFor(p, from, g.dim, g.sort);
-        int pages = Math.max(1, (list.size() + PER_PAGE - 1) / PER_PAGE);
+        List<Waystone> list = listFor(p, from, g.dim, g.favOnly, g.sort);
+        int pages = Math.max(1, (list.size() + TP_PER_PAGE - 1) / TP_PER_PAGE);
         if (g.page >= pages) g.page = pages - 1;
         if (g.page < 0) g.page = 0;
         Inventory inv = g.inv;
 
-        int start = g.page * PER_PAGE;
-        for (int i = 0; i < PER_PAGE && start + i < list.size(); i++) {
-            inv.setItem(i, waystoneItem(p, list.get(start + i)));
+        int start = g.page * TP_PER_PAGE;
+        for (int i = 0; i < TP_PER_PAGE && start + i < list.size(); i++) {
+            inv.setItem(i, waystoneItem(p, list.get(start + i), g.favOnly));
         }
         if (list.isEmpty()) {
-            inv.setItem(22, button(Material.PAPER, ChatColor.GRAY + "Nothing here yet", "none", false,
-                    ChatColor.DARK_GRAY + "Walk up to " + dimName(g.dim) + " waystones",
-                    ChatColor.DARK_GRAY + "and click them to discover them."));
+            if (g.favOnly) {
+                inv.setItem(13, button(Material.PAPER, ChatColor.GRAY + "No favorites yet", "none", false,
+                        ChatColor.DARK_GRAY + "Right-click a waystone in any list",
+                        ChatColor.DARK_GRAY + "to add it to your favorites."));
+            } else {
+                inv.setItem(13, button(Material.PAPER, ChatColor.GRAY + "Nothing here yet", "none", false,
+                        ChatColor.DARK_GRAY + "Walk up to " + dimName(g.dim) + " waystones",
+                        ChatColor.DARK_GRAY + "and click them to discover them."));
+            }
         }
 
-        fill(inv, 45, 54);
+        fill(inv, 36, 54);
         String pageInfo = ChatColor.GRAY + "Page " + (g.page + 1) + "/" + pages;
-        if (g.page > 0) inv.setItem(45, button(Material.ARROW, ChatColor.YELLOW + "Previous page", "prev", false, pageInfo));
-        if (g.page < pages - 1) inv.setItem(53, button(Material.ARROW, ChatColor.YELLOW + "Next page", "next", false, pageInfo));
+        if (g.page > 0) inv.setItem(36, button(Material.ARROW, ChatColor.YELLOW + "Previous page", "prev", false, pageInfo));
+        if (g.page < pages - 1) inv.setItem(44, button(Material.ARROW, ChatColor.YELLOW + "Next page", "next", false, pageInfo));
 
-        inv.setItem(47, dimTab(Material.GRASS_BLOCK, Dim.OVERWORLD, g, p, from));
-        inv.setItem(48, dimTab(Material.NETHERRACK, Dim.NETHER, g, p, from));
-        inv.setItem(49, dimTab(Material.END_STONE, Dim.END, g, p, from));
+        inv.setItem(37, dimTab(Material.GRASS_BLOCK, Dim.OVERWORLD, g, p, from));
+        inv.setItem(38, dimTab(Material.NETHERRACK, Dim.NETHER, g, p, from));
+        inv.setItem(39, dimTab(Material.END_STONE, Dim.END, g, p, from));
+
+        int favCount = listFor(p, from, g.dim, true, g.sort).size();
+        inv.setItem(40, button(Material.NETHER_STAR, ChatColor.GOLD + "Favorites", "fav_tab", g.favOnly,
+                ChatColor.GRAY + "" + favCount + " favorite" + (favCount == 1 ? "" : "s"),
+                ChatColor.DARK_GRAY + "Right-click any waystone to add it"));
 
         String sortName = switch (g.sort) {
             case DISTANCE -> "Closest first";
             case NAME -> "Name (A-Z)";
             case NEWEST -> "Newest first";
         };
-        inv.setItem(51, button(Material.HOPPER, ChatColor.AQUA + "Sort: " + sortName, "sort", false,
+        inv.setItem(41, button(Material.HOPPER, ChatColor.AQUA + "Sort: " + sortName, "sort", false,
                 (g.sort == Sort.DISTANCE ? ChatColor.GREEN + "> " : ChatColor.GRAY + "  ") + "Closest first",
                 (g.sort == Sort.NAME ? ChatColor.GREEN + "> " : ChatColor.GRAY + "  ") + "Name (A-Z)",
                 (g.sort == Sort.NEWEST ? ChatColor.GREEN + "> " : ChatColor.GRAY + "  ") + "Newest first",
-                "", ChatColor.YELLOW + "Click to change", ChatColor.DARK_GRAY + "Pinned waystones always stay on top"));
+                "", ChatColor.YELLOW + "Click to change", ChatColor.DARK_GRAY + "Favorites always stay on top"));
 
+        boolean favHere = isFavorite(p, from);
+        inv.setItem(45, button(Material.GOLD_NUGGET,
+                (favHere ? ChatColor.GOLD + "\u2605 " : ChatColor.YELLOW) + "Favorite this waystone", "pin_self", favHere,
+                ChatColor.GRAY + plainName(from),
+                ChatColor.YELLOW + (favHere ? "Click to remove from favorites" : "Click to add to favorites")));
+
+        inv.setItem(47, button(Material.RED_CONCRETE, ChatColor.RED + "Deactivate for me", "forget", false,
+                ChatColor.GRAY + "Removes " + plainName(from) + " from your list.",
+                ChatColor.GRAY + "Other players can still use it.",
+                ChatColor.DARK_GRAY + "Click the waystone again to re-activate it."));
+        inv.setItem(49, exitButton());
         if (canManage(p, from)) {
-            inv.setItem(52, button(Material.NAME_TAG, ChatColor.GOLD + "Settings", "settings", false,
+            inv.setItem(53, button(Material.NAME_TAG, ChatColor.GOLD + "Settings", "settings", false,
                     ChatColor.GRAY + "Customize this waystone",
                     ChatColor.DARK_GRAY + "(or sneak + right-click it)"));
         }
     }
 
     private ItemStack dimTab(Material mat, Dim dim, Gui g, Player p, Waystone from) {
-        int count = listFor(p, from, dim, g.sort).size();
-        return button(mat, ChatColor.AQUA + dimName(dim), "dim:" + dim.name(), g.dim == dim,
+        int count = listFor(p, from, dim, false, g.sort).size();
+        return button(mat, ChatColor.AQUA + dimName(dim), "dim:" + dim.name(), !g.favOnly && g.dim == dim,
                 ChatColor.GRAY + "" + count + " waystone" + (count == 1 ? "" : "s"));
     }
 
@@ -1024,6 +1054,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + "can see and use it."));
         inv.setItem(22, button(Material.PAPER, ChatColor.DARK_GRAY + "Closing this keeps it Public", "none", false,
                 ChatColor.DARK_GRAY + "You can change it later in Settings."));
+        inv.setItem(26, exitButton());
     }
 
     // ---------- settings ----------
@@ -1060,10 +1091,13 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                     ChatColor.GRAY + "Turn this waystone on so it can be used"));
         } else {
             inv.setItem(16, button(Material.BEACON, ChatColor.GREEN + "Active", "none", false,
-                    ChatColor.GRAY + "This waystone is working"));
+                    ChatColor.GRAY + "This waystone is working.",
+                    ChatColor.DARK_GRAY + "Each player can deactivate it for",
+                    ChatColor.DARK_GRAY + "themselves from the teleport menu."));
         }
-        inv.setItem(31, button(Material.BARRIER, ChatColor.RED + "Dismantle", "dismantle_menu", false,
+        inv.setItem(31, button(Material.PISTON, ChatColor.GOLD + "Dismantle", "dismantle_menu", false,
                 ChatColor.GRAY + "Pack it up to move it, or delete it"));
+        inv.setItem(35, exitButton());
     }
 
     // ---------- icon picker ----------
@@ -1080,6 +1114,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         inv.setItem(38, button(Material.HOPPER, ChatColor.AQUA + "Use the item in your hand", "icon_hand", false,
                 ChatColor.GRAY + "Hold any item, then click here"));
         inv.setItem(42, button(Material.ARROW, ChatColor.YELLOW + "Back", "back", false));
+        inv.setItem(44, exitButton());
     }
 
     // ---------- whitelist ----------
@@ -1123,6 +1158,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + "waystone even when it is Private.",
                 ChatColor.GRAY + "Online players are listed so you can add them."));
         inv.setItem(49, button(Material.ARROW, ChatColor.YELLOW + "Back", "back", false));
+        inv.setItem(51, exitButton());
     }
 
     private String nameOf(UUID id) {
@@ -1156,6 +1192,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + "It will float and spin above the waystone"));
         inv.setItem(33, button(Material.BARRIER, ChatColor.RED + "Remove floating item", "holo_remove", false));
         inv.setItem(40, button(Material.ARROW, ChatColor.YELLOW + "Back", "back", false));
+        inv.setItem(44, exitButton());
     }
 
     // ---------- dismantle ----------
@@ -1166,6 +1203,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + "Get a waystone item that keeps its name",
                 ChatColor.GRAY + "and settings. Place it to move it."));
         inv.setItem(13, button(Material.ARROW, ChatColor.YELLOW + "Cancel", "back", false));
+        inv.setItem(22, exitButton());
         inv.setItem(15, button(Material.TNT, ChatColor.RED + "Delete completely", "delete", false,
                 ChatColor.GRAY + "Removes the waystone and its settings.",
                 ChatColor.GRAY + "You get a fresh waystone item back."));
@@ -1200,6 +1238,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             case "next" -> { g.page++; render(p, g); }
             case "dim" -> {
                 g.dim = Dim.valueOf(arg);
+                g.favOnly = false;
                 g.page = 0;
                 render(p, g);
             }
@@ -1223,6 +1262,31 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                     p.closeInventory();
                     startTeleport(p, dest);
                 }
+            }
+            case "fav_tab" -> {
+                g.favOnly = true;
+                g.page = 0;
+                render(p, g);
+            }
+            case "pin_self" -> {
+                boolean now = toggleFavorite(p, w);
+                sound(p, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, now ? 1.5f : 0.8f);
+                p.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.RESET
+                        + (now ? " added to" : " removed from") + " your favorites."));
+                render(p, g);
+            }
+            case "close" -> p.closeInventory();
+            case "forget" -> {
+                discovered.computeIfAbsent(p.getUniqueId(), k -> new HashSet<>()).remove(w.id);
+                Set<UUID> favs = favorites.get(p.getUniqueId());
+                if (favs != null) favs.remove(w.id);
+                save();
+                applyVisibility(p, w);
+                p.closeInventory();
+                sound(p, Sound.BLOCK_BEACON_DEACTIVATE, 1f);
+                p.sendMessage(msg(ChatColor.RED + plainName(w) + ChatColor.RESET
+                        + " was deactivated for you. Other players can still use it."));
+                p.sendMessage(msg(ChatColor.GRAY + "Click it again any time to re-activate it for yourself."));
             }
             case "settings" -> {
                 if (manage) later(() -> openGui(p, Kind.SETTINGS, w));
@@ -1596,8 +1660,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         for (Entity pet : pets) pet.teleport(target);
         cooldowns.put(p.getUniqueId(), System.currentTimeMillis());
 
-        target.getWorld().spawnParticle(Particle.PORTAL, target.clone().add(0, 1, 0), 60, 0.4, 0.8, 0.4, 0.5);
-        target.getWorld().playSound(target, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 1f);
+        arrivalEffect(target);
 
         int extras = pets.size() + (vehicle != null ? 1 : 0);
         for (Seat s : seats) {
@@ -1610,6 +1673,35 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
         p.sendMessage(msg("Teleported to " + ChatColor.GREEN + plainName(dest) + ChatColor.RESET
                 + (extras > 0 ? ChatColor.GRAY + " (companions came along)" : "") + "."));
+    }
+
+    /** Burst plus a short rising double spiral where the player arrives. */
+    private void arrivalEffect(Location loc) {
+        World world = loc.getWorld();
+        Location c = loc.clone().add(0, 1, 0);
+        world.spawnParticle(Particle.PORTAL, c, 80, 0.5, 0.9, 0.5, 0.6);
+        world.spawnParticle(Particle.END_ROD, c, 40, 0.4, 0.8, 0.4, 0.08);
+        world.playSound(loc, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 1f);
+        world.playSound(loc, Sound.BLOCK_AMETHYST_BLOCK_CHIME, 1f, 1.4f);
+        new BukkitRunnable() {
+            int t = 0;
+
+            @Override
+            public void run() {
+                if (t >= 14) {
+                    cancel();
+                    return;
+                }
+                double y = t * 0.16;
+                for (int arm = 0; arm < 2; arm++) {
+                    double a = t * 0.7 + arm * Math.PI;
+                    world.spawnParticle(Particle.END_ROD,
+                            loc.getX() + Math.cos(a) * 0.9, loc.getY() + y, loc.getZ() + Math.sin(a) * 0.9,
+                            1, 0, 0, 0, 0);
+                }
+                t++;
+            }
+        }.runTaskTimer(this, 0L, 1L);
     }
 
     private void later2(Runnable r) {
@@ -1693,7 +1785,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 Set<UUID> known = discovered.getOrDefault(p.getUniqueId(), Collections.emptySet());
                 List<Waystone> list = waystones.values().stream()
                         .filter(w -> w.active && visibleTo(p, w))
-                        .filter(w -> known.contains(w.id) || w.owner.equals(p.getUniqueId()))
+                        .filter(w -> known.contains(w.id))
                         .collect(Collectors.toList());
                 p.sendMessage(msg("You can travel to " + list.size() + " waystone(s):"));
                 for (Waystone w : list) {
