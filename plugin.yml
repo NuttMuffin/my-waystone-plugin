@@ -1,0 +1,20 @@
+name: Waystones
+version: 1.6.0
+main: dev.waystones.WaystonePlugin
+api-version: '26.2'
+description: Craftable waystones that teleport players between each other.
+commands:
+  waystone:
+    description: Manage waystones
+    usage: /waystone <rename|list> [name]
+    aliases: [ws]
+permissions:
+  waystone.use:
+    description: Use waystones
+    default: true
+  waystone.create:
+    description: Place waystones
+    default: true
+  waystone.admin:
+    description: Break/rename anyone's waystone
+    default: op

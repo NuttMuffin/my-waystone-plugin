@@ -1,0 +1,8 @@
+# Seconds a player must wait between teleports
+cooldown-seconds: 5
+
+# If true, players only see waystones they have already activated (right-clicked)
+require-discovery: true
+
+# Allow teleporting between worlds (overworld, nether, end, etc.)
+cross-world: true
