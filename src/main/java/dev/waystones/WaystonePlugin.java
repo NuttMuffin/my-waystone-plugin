@@ -12,6 +12,7 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.AbstractHorse;
+import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.ItemDisplay;
@@ -32,6 +33,7 @@ import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.inventory.PrepareAnvilEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -59,7 +61,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     // ====================================================================
     // Types
     // ====================================================================
-    enum Kind { TELEPORT, VISIBILITY, SETTINGS, ICON, WHITELIST, HOLOGRAM, DISMANTLE }
+    enum Kind { TELEPORT, VISIBILITY, SETTINGS, ICON, WHITELIST, HOLOGRAM, DISMANTLE, PERSONAL }
     enum Dim { OVERWORLD, NETHER, END }
     enum Sort { DISTANCE, NAME, NEWEST }
 
@@ -85,6 +87,11 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         Material shownItem;
         double spin;
 
+        // Bedrock-friendly copies: invisible armor stands with name tags / a helmet item
+        ArmorStand bName, bActive, bStatus, bItem;
+        String bTextName, bTextActive, bTextStatus;
+        Material bShownItem;
+
         Waystone(UUID id, String name, UUID owner, String ownerName, Location base) {
             this.id = id;
             this.name = name;
@@ -102,6 +109,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         Sort sort = Sort.DISTANCE;
         int page = 0;
         boolean favOnly = false;
+        boolean favMode = false;
         Inventory inv;
 
         Gui(Kind kind, UUID waystone) {
@@ -173,6 +181,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     private final Map<String, Waystone> blockIndex = new HashMap<>();
     private final Map<UUID, Set<UUID>> discovered = new HashMap<>();
     private final Map<UUID, Set<UUID>> favorites = new HashMap<>();
+    private final Map<UUID, Map<UUID, Material>> personalIcons = new HashMap<>();
     private final Map<UUID, Long> cooldowns = new HashMap<>();
     private final Map<UUID, BukkitTask> warmups = new HashMap<>();
     private final Map<UUID, AnvilSession> anvilSessions = new HashMap<>();
@@ -194,6 +203,9 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
         registerRecipe();
         getServer().getPluginManager().registerEvents(this, this);
+        if (getConfig().getBoolean("unlock-recipe", true)) {
+            for (Player online : Bukkit.getOnlinePlayers()) online.discoverRecipe(recipeKey);
+        }
         PluginCommand cmd = getCommand("waystone");
         if (cmd != null) {
             cmd.setExecutor(this);
@@ -201,6 +213,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
         getServer().getScheduler().runTask(this, this::load);
         getServer().getScheduler().runTaskTimer(this, this::tickHolograms, 40L, 20L);
+        getServer().getScheduler().runTaskTimer(this, this::spinBedrock, 40L, 3L);
     }
 
     @Override
@@ -324,8 +337,23 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         return visibleTo(p, w) || p.hasPermission("waystone.admin");
     }
 
+    /** Settings are owner-only. */
     private boolean canManage(Player p, Waystone w) {
+        return w.owner.equals(p.getUniqueId());
+    }
+
+    /** Breaking / first activation: the owner or an operator. */
+    private boolean canRemove(Player p, Waystone w) {
         return w.owner.equals(p.getUniqueId()) || p.hasPermission("waystone.admin");
+    }
+
+    private Material iconFor(Player p, Waystone w) {
+        Map<UUID, Material> mine = personalIcons.get(p.getUniqueId());
+        if (mine != null) {
+            Material m = mine.get(w.id);
+            if (m != null) return m;
+        }
+        return w.icon;
     }
 
     private boolean isFavorite(Player p, Waystone w) {
@@ -473,23 +501,45 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         discovered.computeIfAbsent(p.getUniqueId(), k -> new HashSet<>()).add(w.id);
         save();
         updateHolo(w);
+        showActivated(p, w);
+    }
+
+    /** "Waystone Activated" feedback. The menu does NOT open on this first click. */
+    private void showActivated(Player p, Waystone w) {
         World world = w.base.getWorld();
         Location c = w.base.clone().add(0.5, 1.5, 0.5);
         world.playSound(c, Sound.BLOCK_BEACON_ACTIVATE, 1f, 1.3f);
         world.playSound(c, Sound.BLOCK_ENCHANTMENT_TABLE_USE, 1f, 1f);
         world.spawnParticle(Particle.END_ROD, c, 60, 0.4, 1.0, 0.4, 0.05);
-        p.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.RESET + " is now active!"));
         p.showTitle(Title.title(
-                Component.text("Waystone activated", NamedTextColor.GREEN),
+                Component.text("Waystone Activated", NamedTextColor.GREEN),
                 Component.text(plainName(w), NamedTextColor.GRAY)));
+        p.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.RESET + " is now active. "
+                + ChatColor.YELLOW + "Click it again to open the menu."));
     }
 
     // ====================================================================
     // Hologram (floating name, status line and optional spinning item)
     // ====================================================================
-    private TextDisplay spawnText(Location loc, boolean visibleByDefault) {
+    private boolean isBedrock(Player p) {
+        // Floodgate gives Bedrock players UUIDs that start with zeros
+        return p.getUniqueId().getMostSignificantBits() == 0L;
+    }
+
+    private boolean anyBedrockOnline() {
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            if (isBedrock(pl)) return true;
+        }
+        return false;
+    }
+
+    private float itemScale() {
+        return (float) getConfig().getDouble("hologram.item-scale", 1.6);
+    }
+
+    private TextDisplay spawnText(Location loc) {
         return loc.getWorld().spawn(loc, TextDisplay.class, td -> {
-            td.setVisibleByDefault(visibleByDefault);
+            td.setVisibleByDefault(false); // shown per player below
             td.setPersistent(false);
             td.setBillboard(Display.Billboard.CENTER);
             td.setAlignment(TextDisplay.TextAlignment.CENTER);
@@ -502,37 +552,59 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         td.text(LegacyComponentSerializer.legacySection().deserialize(text));
     }
 
+    private ArmorStand spawnStand(Location loc, boolean showName) {
+        return loc.getWorld().spawn(loc, ArmorStand.class, as -> {
+            as.setVisibleByDefault(false);
+            as.setPersistent(false);
+            as.setVisible(false);
+            as.setGravity(false);
+            as.setMarker(true);
+            as.setInvulnerable(true);
+            as.setSilent(true);
+            as.setBasePlate(false);
+            as.setCollidable(false);
+            as.setCustomNameVisible(showName);
+        });
+    }
+
+    private void setStandName(ArmorStand as, String text) {
+        as.customName(LegacyComponentSerializer.legacySection().deserialize(text));
+    }
+
     private Transformation spinTransform(double angle) {
+        float sc = itemScale();
         return new Transformation(new Vector3f(), new AxisAngle4f((float) angle, 0f, 1f, 0f),
-                new Vector3f(1.2f, 1.2f, 1.2f), new AxisAngle4f(0f, 0f, 1f, 0f));
+                new Vector3f(sc, sc, sc), new AxisAngle4f(0f, 0f, 1f, 0f));
     }
 
     private void refreshHologram(Waystone w) {
         World world = w.base.getWorld();
         if (world == null || !world.isChunkLoaded(w.base.getBlockX() >> 4, w.base.getBlockZ() >> 4)) return;
 
-        Location nameLoc = w.base.clone().add(0.5, 3.55, 0.5);
-        Location statusLoc = w.base.clone().add(0.5, 3.30, 0.5);
-        Location itemLoc = w.base.clone().add(0.5, 4.12, 0.5);
-
-        if (w.holoName == null || !w.holoName.isValid()) {
-            w.holoName = spawnText(nameLoc, true); // name is always visible to everyone
-            w.textName = null;
-        }
-        if (w.holoActive == null || !w.holoActive.isValid()) {
-            w.holoActive = spawnText(statusLoc, false);
-            w.textActive = null;
-        }
-        if (w.holoStatus == null || !w.holoStatus.isValid()) {
-            w.holoStatus = spawnText(statusLoc, false);
-            w.textStatus = null;
-        }
+        double nameY = getConfig().getDouble("hologram.name-y", 3.55);
+        double statusY = getConfig().getDouble("hologram.status-y", 3.30);
+        double itemY = getConfig().getDouble("hologram.item-y", 4.2);
 
         String name = w.nameColor + "" + ChatColor.ITALIC + plainName(w);
         String activeText = ChatColor.GREEN + "" + ChatColor.ITALIC + "Active";
         String statusText = w.isPrivate
                 ? ChatColor.RED + "" + ChatColor.ITALIC + "Private"
                 : ChatColor.GRAY + "" + ChatColor.ITALIC + "Inactive";
+        boolean wantItem = w.holoItem != null && w.holoItemOn;
+
+        // ---------- Java: text + item displays ----------
+        if (w.holoName == null || !w.holoName.isValid()) {
+            w.holoName = spawnText(w.base.clone().add(0.5, nameY, 0.5));
+            w.textName = null;
+        }
+        if (w.holoActive == null || !w.holoActive.isValid()) {
+            w.holoActive = spawnText(w.base.clone().add(0.5, statusY, 0.5));
+            w.textActive = null;
+        }
+        if (w.holoStatus == null || !w.holoStatus.isValid()) {
+            w.holoStatus = spawnText(w.base.clone().add(0.5, statusY, 0.5));
+            w.textStatus = null;
+        }
         if (!name.equals(w.textName)) {
             setText(w.holoName, name);
             w.textName = name;
@@ -546,31 +618,90 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             w.textStatus = statusText;
         }
 
-        // optional floating item
-        boolean wantItem = w.holoItem != null && w.holoItemOn;
         if (!wantItem) {
             if (w.holoItemEnt != null) {
                 w.holoItemEnt.remove();
                 w.holoItemEnt = null;
                 w.shownItem = null;
             }
+        } else if (w.holoItemEnt == null || !w.holoItemEnt.isValid()) {
+            final Material mat = w.holoItem;
+            final double spin = w.spin;
+            w.holoItemEnt = world.spawn(w.base.clone().add(0.5, itemY, 0.5), ItemDisplay.class, d -> {
+                d.setVisibleByDefault(false);
+                d.setPersistent(false);
+                d.setItemStack(new ItemStack(mat));
+                d.setBillboard(Display.Billboard.FIXED);
+                d.setItemDisplayTransform(ItemDisplay.ItemDisplayTransform.FIXED);
+                d.setTransformation(spinTransform(spin));
+            });
+            w.shownItem = w.holoItem;
+        } else if (w.shownItem != w.holoItem) {
+            w.holoItemEnt.setItemStack(new ItemStack(w.holoItem));
+            w.shownItem = w.holoItem;
+        }
+
+        // ---------- Bedrock: armor stands with name tags (only while a Bedrock player is online) ----------
+        boolean wantBedrock = getConfig().getBoolean("bedrock-holograms", true) && anyBedrockOnline();
+        if (!wantBedrock) {
+            removeBedrock(w);
+            return;
+        }
+        if (w.bName == null || !w.bName.isValid()) {
+            w.bName = spawnStand(w.base.clone().add(0.5, nameY - 0.5, 0.5), true);
+            w.bTextName = null;
+        }
+        if (w.bActive == null || !w.bActive.isValid()) {
+            w.bActive = spawnStand(w.base.clone().add(0.5, statusY - 0.5, 0.5), true);
+            w.bTextActive = null;
+        }
+        if (w.bStatus == null || !w.bStatus.isValid()) {
+            w.bStatus = spawnStand(w.base.clone().add(0.5, statusY - 0.5, 0.5), true);
+            w.bTextStatus = null;
+        }
+        if (!name.equals(w.bTextName)) {
+            setStandName(w.bName, name);
+            w.bTextName = name;
+        }
+        if (!activeText.equals(w.bTextActive)) {
+            setStandName(w.bActive, activeText);
+            w.bTextActive = activeText;
+        }
+        if (!statusText.equals(w.bTextStatus)) {
+            setStandName(w.bStatus, statusText);
+            w.bTextStatus = statusText;
+        }
+        if (!wantItem) {
+            if (w.bItem != null) {
+                w.bItem.remove();
+                w.bItem = null;
+                w.bShownItem = null;
+            }
         } else {
-            if (w.holoItemEnt == null || !w.holoItemEnt.isValid()) {
-                final Material mat = w.holoItem;
-                final double spin = w.spin;
-                w.holoItemEnt = world.spawn(itemLoc, ItemDisplay.class, d -> {
-                    d.setPersistent(false);
-                    d.setItemStack(new ItemStack(mat));
-                    d.setBillboard(Display.Billboard.FIXED);
-                    d.setItemDisplayTransform(ItemDisplay.ItemDisplayTransform.GROUND);
-                    d.setTransformation(spinTransform(spin));
-                });
-                w.shownItem = w.holoItem;
-            } else if (w.shownItem != w.holoItem) {
-                w.holoItemEnt.setItemStack(new ItemStack(w.holoItem));
-                w.shownItem = w.holoItem;
+            if (w.bItem == null || !w.bItem.isValid()) {
+                w.bItem = spawnStand(w.base.clone().add(0.5, itemY - 1.7, 0.5), false);
+                w.bShownItem = null;
+            }
+            if (w.bShownItem != w.holoItem) {
+                w.bItem.getEquipment().setHelmet(new ItemStack(w.holoItem));
+                w.bShownItem = w.holoItem;
             }
         }
+    }
+
+    private void removeBedrock(Waystone w) {
+        if (w.bName != null) w.bName.remove();
+        if (w.bActive != null) w.bActive.remove();
+        if (w.bStatus != null) w.bStatus.remove();
+        if (w.bItem != null) w.bItem.remove();
+        w.bName = null;
+        w.bActive = null;
+        w.bStatus = null;
+        w.bItem = null;
+        w.bTextName = null;
+        w.bTextActive = null;
+        w.bTextStatus = null;
+        w.bShownItem = null;
     }
 
     /** Green "Active" only for players who discovered a public, activated waystone. */
@@ -579,17 +710,25 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 && discovered.getOrDefault(p.getUniqueId(), Collections.emptySet()).contains(w.id);
     }
 
+    private void setSeen(Player p, Entity e, boolean seen) {
+        if (e == null || !e.isValid()) return;
+        if (seen) p.showEntity(this, e);
+        else p.hideEntity(this, e);
+    }
+
+    /** Java players see text/item displays, Bedrock players see the armor-stand versions. */
     private void applyVisibility(Player p, Waystone w) {
-        if (w.holoActive == null || w.holoStatus == null) return;
-        if (!w.holoActive.isValid() || !w.holoStatus.isValid()) return;
         if (!p.getWorld().equals(w.base.getWorld())) return;
-        if (activeFor(p, w)) {
-            p.showEntity(this, w.holoActive);
-            p.hideEntity(this, w.holoStatus);
-        } else {
-            p.showEntity(this, w.holoStatus);
-            p.hideEntity(this, w.holoActive);
-        }
+        boolean bedrock = isBedrock(p);
+        boolean active = activeFor(p, w);
+        setSeen(p, w.holoName, !bedrock);
+        setSeen(p, w.holoActive, !bedrock && active);
+        setSeen(p, w.holoStatus, !bedrock && !active);
+        setSeen(p, w.holoItemEnt, !bedrock);
+        setSeen(p, w.bName, bedrock);
+        setSeen(p, w.bActive, bedrock && active);
+        setSeen(p, w.bStatus, bedrock && !active);
+        setSeen(p, w.bItem, bedrock);
     }
 
     private void updateHolo(Waystone w) {
@@ -610,6 +749,14 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
     }
 
+    private void spinBedrock() {
+        for (Waystone w : waystones.values()) {
+            if (w.bItem != null && w.bItem.isValid()) {
+                w.bItem.setRotation(w.bItem.getLocation().getYaw() + 12f, 0f);
+            }
+        }
+    }
+
     private void removeHolos(Waystone w) {
         if (w.holoName != null) w.holoName.remove();
         if (w.holoActive != null) w.holoActive.remove();
@@ -623,6 +770,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         w.textActive = null;
         w.textStatus = null;
         w.shownItem = null;
+        removeBedrock(w);
     }
 
     // ====================================================================
@@ -633,6 +781,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         for (int i = 0; i < 3; i++) w.base.clone().add(0, i, 0).getBlock().setType(Material.AIR);
         for (Set<UUID> set : favorites.values()) set.remove(w.id);
         for (Set<UUID> set : discovered.values()) set.remove(w.id);
+        for (Map<UUID, Material> icons : personalIcons.values()) icons.remove(w.id);
         save();
     }
 
@@ -642,7 +791,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         if (w == null) return;
         Player p = e.getPlayer();
         e.setCancelled(true);
-        if (!canManage(p, w)) {
+        if (!canRemove(p, w)) {
             p.sendMessage(msg(ChatColor.RED + "Only " + w.ownerName + " can remove this waystone."));
             return;
         }
@@ -700,13 +849,16 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             p.sendMessage(msg(ChatColor.RED + "You can't use waystones."));
             return;
         }
-        boolean manage = canManage(p, w);
+        boolean owner = canManage(p, w);
         if (p.isSneaking()) {
-            if (!manage) {
+            if (owner) {
+                openGui(p, Kind.SETTINGS, w);
+            } else if (w.active && visibleTo(p, w)
+                    && discovered.getOrDefault(p.getUniqueId(), Collections.emptySet()).contains(w.id)) {
+                openGui(p, Kind.PERSONAL, w);
+            } else {
                 p.sendMessage(msg(ChatColor.RED + "Only the owner can change this waystone's settings."));
-                return;
             }
-            openGui(p, Kind.SETTINGS, w);
             return;
         }
         if (!canUseBlock(p, w)) {
@@ -715,7 +867,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             return;
         }
         if (!w.active) {
-            if (manage) activate(p, w);
+            if (canRemove(p, w)) activate(p, w);
             else p.sendMessage(msg(ChatColor.RED + "This waystone hasn't been activated yet."));
             return;
         }
@@ -723,8 +875,8 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         if (known.add(w.id)) {
             save();
             applyVisibility(p, w);
-            p.sendMessage(msg("Discovered " + ChatColor.GREEN + plainName(w) + ChatColor.RESET + "!"));
-            sound(p, Sound.BLOCK_ENCHANTMENT_TABLE_USE, 1f);
+            showActivated(p, w);
+            return; // the first click only activates it; click again to open the menu
         }
         openGui(p, Kind.TELEPORT, w);
     }
@@ -833,6 +985,12 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
     }
 
+    /** Adds the Waystone recipe to every player's recipe book when they join. */
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        if (getConfig().getBoolean("unlock-recipe", true)) e.getPlayer().discoverRecipe(recipeKey);
+    }
+
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         Player p = e.getPlayer();
@@ -880,6 +1038,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             case WHITELIST -> "Whitelist";
             case HOLOGRAM -> "Hologram settings";
             case DISMANTLE -> "Dismantle waystone";
+            case PERSONAL -> "My icon: " + shortName;
         };
         g.inv = Bukkit.createInventory(g, size, title);
         render(p, g);
@@ -901,6 +1060,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             case WHITELIST -> renderWhitelist(g, w);
             case HOLOGRAM -> renderHologram(g, w);
             case DISMANTLE -> renderDismantle(g, w);
+            case PERSONAL -> renderPersonal(p, g, w);
         }
     }
 
@@ -947,7 +1107,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
     private ItemStack waystoneItem(Player p, Waystone w, boolean showDim) {
         boolean fav = isFavorite(p, w);
-        ItemStack it = new ItemStack(w.icon);
+        ItemStack it = new ItemStack(iconFor(p, w));
         ItemMeta m = it.getItemMeta();
         m.setDisplayName((fav ? ChatColor.GOLD + "\u2605 " : "") + w.nameColor + plainName(w));
         List<String> lore = new ArrayList<>();
@@ -1022,6 +1182,12 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + plainName(from),
                 ChatColor.YELLOW + (favHere ? "Click to remove from favorites" : "Click to add to favorites")));
 
+        inv.setItem(46, button(Material.GOLD_INGOT,
+                ChatColor.YELLOW + "Favorite mode: " + (g.favMode ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"),
+                "favmode", g.favMode,
+                ChatColor.GRAY + "When ON, clicking a waystone adds or",
+                ChatColor.GRAY + "removes it from favorites instead of",
+                ChatColor.GRAY + "teleporting (handy without right-click)."));
         inv.setItem(47, button(Material.RED_CONCRETE, ChatColor.RED + "Deactivate for me", "forget", false,
                 ChatColor.GRAY + "Removes " + plainName(from) + " from your list.",
                 ChatColor.GRAY + "Other players can still use it.",
@@ -1031,6 +1197,10 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             inv.setItem(53, button(Material.NAME_TAG, ChatColor.GOLD + "Settings", "settings", false,
                     ChatColor.GRAY + "Customize this waystone",
                     ChatColor.DARK_GRAY + "(or sneak + right-click it)"));
+        } else {
+            inv.setItem(53, button(Material.ITEM_FRAME, ChatColor.GOLD + "My icon", "personal", false,
+                    ChatColor.GRAY + "Change how " + plainName(from) + " looks",
+                    ChatColor.GRAY + "in your own teleport menu."));
         }
     }
 
@@ -1209,6 +1379,22 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                 ChatColor.GRAY + "You get a fresh waystone item back."));
     }
 
+    // ---------- personal icon (any player) ----------
+    private void renderPersonal(Player p, Gui g, Waystone w) {
+        Inventory inv = g.inv;
+        fill(inv, 0, 27);
+        Material cur = iconFor(p, w);
+        inv.setItem(4, button(cur, ChatColor.AQUA + "Your icon for " + plainName(w), "none", false,
+                ChatColor.GRAY + pretty(cur),
+                ChatColor.DARK_GRAY + "Only you see this in your teleport menu."));
+        inv.setItem(11, button(Material.ITEM_FRAME, ChatColor.YELLOW + "Use the item in your hand", "my_icon_hand", false,
+                ChatColor.GRAY + "Hold the item you want,",
+                ChatColor.GRAY + "then click here."));
+        inv.setItem(15, button(Material.BUCKET, ChatColor.YELLOW + "Reset to default", "my_icon_reset", false,
+                ChatColor.GRAY + "Use the icon the owner picked."));
+        inv.setItem(22, exitButton());
+    }
+
     // ---------- click handling ----------
     @EventHandler
     public void onGuiClick(InventoryClickEvent e) {
@@ -1254,7 +1440,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                     p.sendMessage(msg(ChatColor.RED + "That waystone is no longer available."));
                     return;
                 }
-                if (altClick) {
+                if (altClick || g.favMode) {
                     boolean now = toggleFavorite(p, dest);
                     sound(p, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, now ? 1.5f : 0.8f);
                     render(p, g);
@@ -1262,6 +1448,33 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
                     p.closeInventory();
                     startTeleport(p, dest);
                 }
+            }
+            case "favmode" -> {
+                g.favMode = !g.favMode;
+                sound(p, Sound.BLOCK_LEVER_CLICK, 1f);
+                render(p, g);
+            }
+            case "personal" -> {
+                if (visibleTo(p, w)) later(() -> openGui(p, Kind.PERSONAL, w));
+            }
+            case "my_icon_hand" -> {
+                if (!visibleTo(p, w)) return;
+                Material held = p.getInventory().getItemInMainHand().getType();
+                if (held.isAir() || !held.isItem()) {
+                    p.sendMessage(msg(ChatColor.RED + "Hold an item in your main hand first."));
+                    return;
+                }
+                personalIcons.computeIfAbsent(p.getUniqueId(), k -> new HashMap<>()).put(w.id, held);
+                save();
+                sound(p, Sound.UI_BUTTON_CLICK, 1f);
+                render(p, g);
+            }
+            case "my_icon_reset" -> {
+                Map<UUID, Material> mine = personalIcons.get(p.getUniqueId());
+                if (mine != null) mine.remove(w.id);
+                save();
+                sound(p, Sound.UI_BUTTON_CLICK, 0.8f);
+                render(p, g);
             }
             case "fav_tab" -> {
                 g.favOnly = true;
@@ -1713,6 +1926,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     // ====================================================================
     @Override
     public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+        if (a.length > 0 && a[0].equalsIgnoreCase("admin")) return handleAdmin(s, a);
         if (!(s instanceof Player p)) {
             s.sendMessage("Players only.");
             return true;
@@ -1722,6 +1936,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             p.sendMessage(msg("/waystone settings  - open settings for the waystone you're looking at"));
             p.sendMessage(msg("/waystone rename <name>, /waystone private, /waystone public"));
             p.sendMessage(msg("/waystone favorite, /waystone list"));
+            if (p.hasPermission("waystone.admin")) p.sendMessage(msg(ChatColor.GOLD + "/waystone admin help" + ChatColor.RESET + " - operator tools"));
             return true;
         }
         switch (a[0].toLowerCase()) {
@@ -1805,8 +2020,262 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
     @Override
     public List<String> onTabComplete(CommandSender s, Command c, String l, String[] a) {
-        if (a.length == 1) return List.of("settings", "rename", "private", "public", "favorite", "list");
+        if (a.length == 1) {
+            List<String> subs = new ArrayList<>(List.of("settings", "rename", "private", "public", "favorite", "list"));
+            if (s.hasPermission("waystone.admin")) subs.add("admin");
+            return subs.stream().filter(x -> x.startsWith(a[0].toLowerCase())).collect(Collectors.toList());
+        }
+        if (a[0].equalsIgnoreCase("admin") && s.hasPermission("waystone.admin")) {
+            if (a.length == 2) {
+                return List.of("help", "list", "info", "tp", "remove", "removeall", "rename", "public", "private",
+                        "activate", "deactivate", "resetcounter", "setcounter", "forget", "reload").stream()
+                        .filter(x -> x.startsWith(a[1].toLowerCase())).collect(Collectors.toList());
+            }
+            if (a.length == 3) {
+                String sub = a[1].toLowerCase();
+                if (sub.equals("list") || sub.equals("removeall") || sub.equals("forget")) {
+                    return Bukkit.getOnlinePlayers().stream().map(Player::getName)
+                            .filter(x -> x.toLowerCase().startsWith(a[2].toLowerCase())).collect(Collectors.toList());
+                }
+                return waystones.values().stream().map(this::shortId)
+                        .filter(x -> x.startsWith(a[2].toLowerCase())).collect(Collectors.toList());
+            }
+        }
         return Collections.emptyList();
+    }
+
+    // ====================================================================
+    // Operator commands: /waystone admin ...
+    // ====================================================================
+    private String shortId(Waystone w) {
+        return w.id.toString().substring(0, 8);
+    }
+
+    /** Finds a waystone by id prefix (min 3 chars) or by exact one-word name. */
+    private Waystone findWaystone(String ref) {
+        if (ref == null || ref.isEmpty()) return null;
+        String low = ref.toLowerCase();
+        List<Waystone> hits = new ArrayList<>();
+        if (low.length() >= 3) {
+            for (Waystone w : waystones.values()) {
+                if (w.id.toString().startsWith(low)) hits.add(w);
+            }
+        }
+        if (hits.isEmpty()) {
+            for (Waystone w : waystones.values()) {
+                if (plainName(w).equalsIgnoreCase(ref)) hits.add(w);
+            }
+        }
+        return hits.size() == 1 ? hits.get(0) : null;
+    }
+
+    private Waystone adminTarget(CommandSender s, String[] a, int idx) {
+        if (a.length > idx) {
+            Waystone w = findWaystone(a[idx]);
+            if (w == null) {
+                s.sendMessage(msg(ChatColor.RED + "No single waystone matches \"" + a[idx]
+                        + "\". Use /waystone admin list to see ids."));
+            }
+            return w;
+        }
+        if (s instanceof Player pl) {
+            Waystone w = lookedAt(pl);
+            if (w == null) s.sendMessage(msg(ChatColor.RED + "Look at a waystone, or give its id."));
+            return w;
+        }
+        s.sendMessage(msg(ChatColor.RED + "Give a waystone id (see /waystone admin list)."));
+        return null;
+    }
+
+    private void adminHelp(CommandSender s) {
+        s.sendMessage(msg(ChatColor.GOLD + "Operator commands " + ChatColor.GRAY
+                + "(<id> = first 8 characters from the list, or look at a waystone)"));
+        s.sendMessage(ChatColor.GRAY + " /waystone admin list [player]");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin info [id]");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin tp [id]");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin remove [id]");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin removeall <player> confirm");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin rename <id> <new name>");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin public|private [id]");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin activate|deactivate [id]  (for everyone)");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin resetcounter   (next default name is Waystone 1)");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin setcounter <number>");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin forget <player> [id]  (reset what a player discovered)");
+        s.sendMessage(ChatColor.GRAY + " /waystone admin reload");
+    }
+
+    private boolean handleAdmin(CommandSender s, String[] a) {
+        if (!s.hasPermission("waystone.admin")) {
+            s.sendMessage(msg(ChatColor.RED + "You don't have permission to do that."));
+            return true;
+        }
+        String sub = a.length > 1 ? a[1].toLowerCase() : "help";
+        switch (sub) {
+            case "list" -> {
+                String filter = a.length > 2 ? a[2] : null;
+                List<Waystone> list = waystones.values().stream()
+                        .filter(w -> filter == null || w.ownerName.equalsIgnoreCase(filter))
+                        .collect(Collectors.toList());
+                s.sendMessage(msg(list.size() + " waystone(s)" + (filter == null ? "" : " owned by " + filter)
+                        + ". Next default name: Waystone " + (counter + 1)));
+                int shown = 0;
+                for (Waystone w : list) {
+                    if (shown++ >= 40) {
+                        s.sendMessage(ChatColor.GRAY + "... and " + (list.size() - 40)
+                                + " more. Filter with /waystone admin list <player>");
+                        break;
+                    }
+                    s.sendMessage(ChatColor.GRAY + "[" + shortId(w) + "] " + ChatColor.GREEN + plainName(w)
+                            + ChatColor.GRAY + " - " + w.ownerName + ", " + w.base.getWorld().getName() + " "
+                            + w.base.getBlockX() + "," + w.base.getBlockY() + "," + w.base.getBlockZ()
+                            + (w.isPrivate ? ChatColor.RED + " [private]" : "")
+                            + (w.active ? "" : ChatColor.YELLOW + " [inactive]"));
+                }
+            }
+            case "info" -> {
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                int seen = 0;
+                for (Set<UUID> set : discovered.values()) {
+                    if (set.contains(w.id)) seen++;
+                }
+                s.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.GRAY + " [" + w.id + "]"));
+                s.sendMessage(ChatColor.GRAY + " Owner: " + w.ownerName + " (" + w.owner + ")");
+                s.sendMessage(ChatColor.GRAY + " Location: " + w.base.getWorld().getName() + " "
+                        + w.base.getBlockX() + ", " + w.base.getBlockY() + ", " + w.base.getBlockZ());
+                s.sendMessage(ChatColor.GRAY + " Active: " + w.active + " | Private: " + w.isPrivate
+                        + " | Whitelisted: " + w.whitelist.size() + " | Discovered by: " + seen + " player(s)");
+                s.sendMessage(ChatColor.GRAY + " Created: " + new Date(w.created));
+            }
+            case "tp", "teleport" -> {
+                if (!(s instanceof Player pl)) {
+                    s.sendMessage("Players only.");
+                    return true;
+                }
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                Spot spot = findSafe(w, pl);
+                Location loc = spot.loc != null ? spot.loc : w.base.clone().add(0.5, 3, 0.5);
+                pl.teleport(loc);
+                s.sendMessage(msg("Teleported to " + ChatColor.GREEN + plainName(w) + ChatColor.RESET + "."));
+            }
+            case "remove", "delete" -> {
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                String name = plainName(w);
+                deleteRecord(w);
+                s.sendMessage(msg("Removed waystone " + ChatColor.GREEN + name + ChatColor.RESET + " (" + w.ownerName + ")."));
+            }
+            case "removeall" -> {
+                if (a.length < 3) {
+                    s.sendMessage(msg(ChatColor.RED + "Usage: /waystone admin removeall <player> confirm"));
+                    return true;
+                }
+                List<Waystone> mine = waystones.values().stream()
+                        .filter(w -> w.ownerName.equalsIgnoreCase(a[2]))
+                        .collect(Collectors.toList());
+                if (a.length < 4 || !a[3].equalsIgnoreCase("confirm")) {
+                    s.sendMessage(msg(ChatColor.YELLOW + "This would delete " + mine.size() + " waystone(s) owned by "
+                            + a[2] + ". Run it again with " + ChatColor.WHITE + "confirm" + ChatColor.YELLOW + " at the end."));
+                    return true;
+                }
+                for (Waystone w : mine) deleteRecord(w);
+                s.sendMessage(msg("Removed " + mine.size() + " waystone(s) owned by " + a[2] + "."));
+            }
+            case "rename" -> {
+                if (a.length < 4) {
+                    s.sendMessage(msg(ChatColor.RED + "Usage: /waystone admin rename <id> <new name>"));
+                    return true;
+                }
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                String name = sanitizeName(String.join(" ", Arrays.copyOfRange(a, 3, a.length)));
+                if (name.isEmpty() || name.length() > 32) {
+                    s.sendMessage(msg(ChatColor.RED + "Names must be 1-32 characters."));
+                    return true;
+                }
+                w.name = name;
+                save();
+                updateHolo(w);
+                s.sendMessage(msg("Renamed to " + ChatColor.GREEN + name + ChatColor.RESET + "."));
+            }
+            case "public", "private" -> {
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                w.isPrivate = sub.equals("private");
+                save();
+                updateHolo(w);
+                s.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.RESET + " is now " + sub + "."));
+            }
+            case "activate", "deactivate" -> {
+                Waystone w = adminTarget(s, a, 2);
+                if (w == null) return true;
+                w.active = sub.equals("activate");
+                if (w.active) discovered.computeIfAbsent(w.owner, k -> new HashSet<>()).add(w.id);
+                save();
+                updateHolo(w);
+                s.sendMessage(msg(ChatColor.GREEN + plainName(w) + ChatColor.RESET + " was "
+                        + (w.active ? "activated" : "deactivated") + " for everyone."));
+            }
+            case "resetcounter" -> {
+                counter = 0;
+                save();
+                s.sendMessage(msg("Counter reset. The next new waystone will be called Waystone 1."));
+            }
+            case "setcounter" -> {
+                if (a.length < 3) {
+                    s.sendMessage(msg(ChatColor.RED + "Usage: /waystone admin setcounter <number>"));
+                    return true;
+                }
+                try {
+                    int n = Integer.parseInt(a[2]);
+                    if (n < 1) throw new NumberFormatException();
+                    counter = n - 1;
+                    save();
+                    s.sendMessage(msg("The next new waystone will be called Waystone " + n + "."));
+                } catch (NumberFormatException ex) {
+                    s.sendMessage(msg(ChatColor.RED + "Give a whole number of 1 or more."));
+                }
+            }
+            case "forget" -> {
+                if (a.length < 3) {
+                    s.sendMessage(msg(ChatColor.RED + "Usage: /waystone admin forget <player> [id]"));
+                    return true;
+                }
+                UUID id = Bukkit.getOfflinePlayer(a[2]).getUniqueId();
+                if (a.length > 3) {
+                    Waystone w = findWaystone(a[3]);
+                    if (w == null) {
+                        s.sendMessage(msg(ChatColor.RED + "No single waystone matches \"" + a[3] + "\"."));
+                        return true;
+                    }
+                    Set<UUID> known = discovered.get(id);
+                    if (known != null) known.remove(w.id);
+                    Set<UUID> favs = favorites.get(id);
+                    if (favs != null) favs.remove(w.id);
+                    Map<UUID, Material> icons = personalIcons.get(id);
+                    if (icons != null) icons.remove(w.id);
+                    s.sendMessage(msg(a[2] + " no longer has " + plainName(w) + " activated."));
+                } else {
+                    discovered.remove(id);
+                    favorites.remove(id);
+                    personalIcons.remove(id);
+                    s.sendMessage(msg("Reset everything " + a[2] + " discovered, favorited and customized."));
+                }
+                save();
+                Player online = Bukkit.getPlayer(id);
+                if (online != null) {
+                    for (Waystone w : waystones.values()) applyVisibility(online, w);
+                }
+            }
+            case "reload" -> {
+                reloadConfig();
+                for (Waystone w : waystones.values()) removeHolos(w); // respawned with the new settings
+                s.sendMessage(msg("Config reloaded."));
+            }
+            default -> adminHelp(s);
+        }
+        return true;
     }
 
     // ====================================================================
@@ -1830,6 +2299,11 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         for (Map.Entry<UUID, Set<UUID>> en : favorites.entrySet()) {
             y.set("favorites." + en.getKey(),
                     en.getValue().stream().map(UUID::toString).collect(Collectors.toList()));
+        }
+        for (Map.Entry<UUID, Map<UUID, Material>> en : personalIcons.entrySet()) {
+            for (Map.Entry<UUID, Material> ic : en.getValue().entrySet()) {
+                y.set("icons." + en.getKey() + "." + ic.getKey(), ic.getValue().name());
+            }
         }
         try {
             getDataFolder().mkdirs();
@@ -1862,6 +2336,24 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
         loadSets(y.getConfigurationSection("discovered"), discovered);
         loadSets(y.getConfigurationSection("favorites"), favorites);
+        ConfigurationSection icons = y.getConfigurationSection("icons");
+        if (icons != null) {
+            for (String pid : icons.getKeys(false)) {
+                ConfigurationSection ps = icons.getConfigurationSection(pid);
+                if (ps == null) continue;
+                Map<UUID, Material> map = new HashMap<>();
+                for (String wid : ps.getKeys(false)) {
+                    Material m = Material.matchMaterial(ps.getString(wid, ""));
+                    if (m == null) continue;
+                    try {
+                        map.put(UUID.fromString(wid), m);
+                    } catch (IllegalArgumentException ignored) { }
+                }
+                try {
+                    personalIcons.put(UUID.fromString(pid), map);
+                } catch (IllegalArgumentException ignored) { }
+            }
+        }
         getLogger().info("Loaded " + waystones.size() + " waystone(s).");
     }
 
