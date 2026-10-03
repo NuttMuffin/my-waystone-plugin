@@ -185,6 +185,8 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
     private final Map<UUID, Long> cooldowns = new HashMap<>();
     private final Map<UUID, BukkitTask> warmups = new HashMap<>();
     private final Map<UUID, AnvilSession> anvilSessions = new HashMap<>();
+    /** New waystones still in the name / Public-Private setup. They can't be activated until setup is finished. */
+    private final Set<UUID> setupPending = new HashSet<>();
     private NamespacedKey itemKey, packedKey, actionKey, recipeKey;
     private File dataFile;
     private int counter = 0;
@@ -487,6 +489,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         } else {
             p.sendMessage(msg("Waystone placed! Name it, choose Public or Private, then "
                     + ChatColor.YELLOW + "click it to activate it" + ChatColor.RESET + "."));
+            setupPending.add(w.id);
             later(() -> openAnvil(p, w, true));
         }
     }
@@ -867,6 +870,12 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
             return;
         }
         if (!w.active) {
+            if (canRemove(p, w) && setupPending.contains(w.id)) {
+                // still being set up: finish naming first, activation comes after
+                p.sendMessage(msg(ChatColor.YELLOW + "Name your waystone first, then click it to activate it."));
+                later(() -> openAnvil(p, w, true));
+                return;
+            }
             if (canRemove(p, w)) activate(p, w);
             else p.sendMessage(msg(ChatColor.RED + "This waystone hasn't been activated yet."));
             return;
@@ -897,6 +906,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
 
     private void openAnvil(Player p, Waystone w, boolean isNew) {
         if (!p.isOnline()) return;
+        if (anvilSessions.containsKey(p.getUniqueId())) return; // naming screen already open
         // Bedrock players get a simple pop-up form with a text box instead of an anvil
         if (isBedrock(p) && getConfig().getBoolean("bedrock-name-form", false)
                 && openBedrockNameForm(p, w, isNew, plainName(w), null)) return;
@@ -1062,6 +1072,7 @@ public class WaystonePlugin extends JavaPlugin implements Listener, TabExecutor 
         }
         if (e.getInventory().getHolder() instanceof Gui g && g.kind == Kind.VISIBILITY) {
             Waystone w = waystones.get(g.waystone);
+            if (w != null) setupPending.remove(w.id); // setup finished, it can be activated now
             if (w != null && !w.active && canManage(p, w)) {
                 p.sendMessage(msg(ChatColor.YELLOW + "Now click the waystone to activate it."));
                 p.sendActionBar(Component.text("Click the waystone to activate it", NamedTextColor.YELLOW));
