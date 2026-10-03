@@ -16,3 +16,18 @@ bring-following-pets: true
 
 # How close (in blocks) a following pet must be to come along
 pet-range: 15
+
+# Add the Waystone recipe to every player's recipe book when they join
+unlock-recipe: true
+
+# Floating hologram above each waystone. Heights are in blocks above the bottom (diamond) block.
+# After editing, run /waystone admin reload.
+hologram:
+  name-y: 3.55      # the italic name line
+  status-y: 3.30    # the Active / Inactive / Private line
+  item-y: 4.2       # centre of the floating item (raise it if it overlaps the name)
+  item-scale: 1.6   # size of the floating item (bigger number = bigger item)
+
+# Bedrock players (joining through Geyser/Floodgate) can't see text/item displays,
+# so they get invisible armor stands with name tags and a helmet item instead.
+bedrock-holograms: true
