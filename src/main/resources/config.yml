@@ -1,110 +1,38 @@
-# ======================================================================
-#  Waystones configuration
-#  After editing, run  /waystone admin reload
-#  Changed the structure blocks? Also run  /waystone admin rebuild all
-#  to update waystones that were already placed.
-# ======================================================================
-
-# ----------------------------------------------------------------------
-#  VISUAL STRUCTURE  (the 3-block pillar, bottom to top)
-#  Use plain solid blocks. Blocks that fall (sand, gravel) or aren't solid
-#  (flowers, torches) are rejected and the default is used instead.
-#  Examples: POLISHED_DEEPSLATE, GOLD_BLOCK, CHISELED_STONE_BRICKS,
-#            COBBLESTONE_WALL, DEEPSLATE_BRICK_WALL, LODESTONE, BEACON,
-#            RESPAWN_ANCHOR, CRYING_OBSIDIAN, AMETHYST_BLOCK, END_ROD (not solid - won't work)
-#  Tip: if you use a taller/shorter top block, adjust the hologram heights below.
-# ----------------------------------------------------------------------
-structure:
-  bottom: DIAMOND_BLOCK
-  middle: STONE_BRICK_WALL
-  top: ENCHANTING_TABLE
-
-# ----------------------------------------------------------------------
-#  THE WAYSTONE ITEM (what players craft and place)
-#  material must be a block that can be placed. Color codes use &.
-# ----------------------------------------------------------------------
-item:
-  material: BREWING_STAND
-  name: "&bWaystone"
-  lore:
-    - "&7Place on the ground to build a waystone."
-    - "&7Name it, pick Public or Private,"
-    - "&7then click it to activate."
-
-# ----------------------------------------------------------------------
-#  CRAFTING RECIPE
-#  shape: up to 3 rows of up to 3 letters (a space means empty).
-#  ingredients: which item each letter stands for.
-#  If the recipe is invalid, the default one is used (see the server log).
-# ----------------------------------------------------------------------
-recipe:
-  enabled: true
-  shape:
-    - "BOB"
-    - "SES"
-    - "DDD"
-  ingredients:
-    B: BOOK
-    O: OBSIDIAN
-    S: STONE_BRICKS
-    E: ENDER_EYE
-    D: DIAMOND
-
-# Add the recipe to every player's recipe book when they join
-unlock-recipe: true
-
-# ----------------------------------------------------------------------
-#  TELEPORTING
-# ----------------------------------------------------------------------
-# Seconds a player must stand still before the teleport happens (0 = instant)
+# Seconds a player must stand still (no moving, no damage) before a teleport happens
 warmup-seconds: 3
-# Cancel the countdown if the player moves / takes damage
-cancel-on-move: true
-cancel-on-damage: true
-# Seconds to wait between teleports (starts only after a successful teleport)
+
+# Seconds a player must wait between teleports (only starts after a successful teleport)
 cooldown-seconds: 5
-# Check the destination for lava, fire, void, etc. and cancel if unsafe
-safety-check: true
-# Show the particle burst and spiral when arriving
-arrival-effects: true
+
+# Players must walk up and click a waystone to discover it before they can travel to it
+require-discovery: true
+
 # Allow teleporting between worlds / dimensions
 cross-world: true
-# Players must walk up and click a waystone to discover it first
-require-discovery: true
+
 # Tamed pets that are following the player (not sitting) travel along.
 # Leashed animals and ridden vehicles always come along.
 bring-following-pets: true
+
 # How close (in blocks) a following pet must be to come along
 pet-range: 15
 
-# ----------------------------------------------------------------------
-#  NEW WAYSTONES
-# ----------------------------------------------------------------------
-# 0 = unlimited. Operators (waystone.admin) are never limited.
-max-waystones-per-player: 0
-# New waystones start Private instead of Public (the owner is still asked)
-default-private: false
-# Longest allowed waystone name
-name-max-length: 32
+# Add the Waystone recipe to every player's recipe book when they join
+unlock-recipe: true
 
-# ----------------------------------------------------------------------
-#  FLOATING HOLOGRAM
-#  Heights are in blocks above the bottom block of the pillar.
-# ----------------------------------------------------------------------
+# Floating hologram above each waystone. Heights are in blocks above the bottom (diamond) block.
+# After editing, run /waystone admin reload.
 hologram:
-  enabled: true
-  show-status: true      # the Active / Inactive / Private line under the name
-  default-name-color: WHITE   # WHITE, YELLOW, GOLD, RED, AQUA, GREEN, LIGHT_PURPLE ...
-  name-y: 3.55           # the italic name line
-  status-y: 3.30         # the status line
-  item-y: 4.05           # centre of the floating item
-  item-scale: 0.9        # size of the floating item (bigger number = bigger)
+  name-y: 3.55      # the italic name line
+  status-y: 3.30    # the Active / Inactive / Private line
+  item-y: 4.2       # centre of the floating item (raise it if it overlaps the name)
+  item-scale: 1.6   # size of the floating item (bigger number = bigger item)
 
-# How Bedrock players name a new waystone: "chat" (type the name in chat - reliable)
-# or "anvil" (the anvil screen, only works if your Geyser version supports it).
-# Java players always get the anvil screen.
-bedrock-naming: chat
-
-# Bedrock players (Geyser/Floodgate) can't see text/item displays,
+# Bedrock players (joining through Geyser/Floodgate) can't see text/item displays,
 # so they get invisible armor stands with name tags and a helmet item instead.
 bedrock-holograms: true
+
+# true = Bedrock players (Geyser/Floodgate) get a pop-up text box to name a waystone
+# instead of the anvil. false = everyone uses the anvil. The form needs Floodgate installed;
+# if it isn't available the anvil is used as a fallback.
+bedrock-name-form: false
